@@ -43,7 +43,6 @@ Socket::Socket(Context& context, const string& type, const string& name, const s
     , fOfiDomain(nullptr)
     , fPassiveEndpoint(nullptr)
     , fDataEndpoint(nullptr)
-    , fControlEndpoint(nullptr)
     , fId(id + "." + name + "." + type)
     , fBytesTx(0)
     , fBytesRx(0)
@@ -71,7 +70,7 @@ Socket::Socket(Context& context, const string& type, const string& name, const s
         fRecvQueueWrite.set_option(recv_max);
 
         // Setup internal queue
-        auto hashed_id = std::hash<std::string>()(fId);
+        auto hashed_id = hash<string>()(fId);
         auto queue_id = tools::ToString("inproc://TXQUEUE", hashed_id);
         queue_id = tools::ToString("inproc://RXQUEUE", hashed_id);
         LOG(debug) << "OFI transport (" << fId << "): " << "Binding RQR: " << queue_id;
@@ -94,9 +93,9 @@ auto Socket::InitOfi(Address addr) -> void
           hints.set_provider("verbs");
       }
       if (fRemoteAddr == addr) {
-          fOfiInfo = tools::make_unique<asiofi::info>(addr.Ip.c_str(), std::to_string(addr.Port).c_str(), 0, hints);
+          fOfiInfo = tools::make_unique<asiofi::info>(addr.Ip.c_str(), to_string(addr.Port).c_str(), 0, hints);
       } else {
-          fOfiInfo = tools::make_unique<asiofi::info>(addr.Ip.c_str(), std::to_string(addr.Port).c_str(), FI_SOURCE, hints);
+          fOfiInfo = tools::make_unique<asiofi::info>(addr.Ip.c_str(), to_string(addr.Port).c_str(), FI_SOURCE, hints);
       }
 
       LOG(debug) << "OFI transport: " << *fOfiInfo;
@@ -120,7 +119,21 @@ try {
     fPassiveEndpoint = tools::make_unique<asiofi::passive_endpoint>(fContext.GetIoContext(), *fOfiFabric);
     //fPassiveEndpoint->set_local_address(Context::ConvertAddress(fLocalAddr));
 
-    BindControlEndpoint();
+    assert(!fDataEndpoint);
+
+    fPassiveEndpoint->listen([&](asiofi::info&& info) {
+        LOG(debug) << "OFI transport (" << fId << "): data band connection request received. Accepting ...";
+        fDataEndpoint = tools::make_unique<asiofi::connected_endpoint>(fContext.GetIoContext(), *fOfiDomain, info);
+        fDataEndpoint->enable();
+        fDataEndpoint->accept([&]() {
+            LOG(debug) << "OFI transport (" << fId << "): data band connection accepted.";
+
+            boost::asio::post(fContext.GetIoContext(), bind(&Socket::RecvQueueReader, this));
+            fBound = true;
+        });
+    });
+
+    LOG(debug) << "OFI transport (" << fId << "): data band bound to " << fLocalAddr;
 
     while (!fBound) {
         this_thread::sleep_for(chrono::milliseconds(100));
@@ -131,53 +144,9 @@ try {
     // do not print error in this case, this is handled by FairMQDevice
     // in case no connection could be established after trying a number of random ports from a range.
     return false;
-}
-catch (const std::exception& e)
-{
+} catch (const SocketError& e) {
     LOG(error) << "OFI transport: " << e.what();
     return false;
-}
-catch (...)
-{
-    LOG(error) << "OFI transport: Unknown exception in ofi::Socket::Bind";
-    return false;
-}
-
-auto Socket::BindControlEndpoint() -> void
-{
-    assert(!fControlEndpoint);
-
-    fPassiveEndpoint->listen([&](asiofi::info&& info) {
-        LOG(debug) << "OFI transport (" << fId << "): control band connection request received. Accepting ...";
-        fControlEndpoint = tools::make_unique<asiofi::connected_endpoint>(fContext.GetIoContext(), *fOfiDomain, info);
-        fControlEndpoint->enable();
-        fControlEndpoint->accept([&]() {
-            LOG(debug) << "OFI transport (" << fId << "): control band connection accepted.";
-
-            BindDataEndpoint();
-        });
-    });
-
-    LOG(debug) << "OFI transport (" << fId << "): control band bound to " << fLocalAddr;
-}
-
-auto Socket::BindDataEndpoint() -> void
-{
-    assert(!fDataEndpoint);
-
-    fPassiveEndpoint->listen([&](asiofi::info&& info) {
-        LOG(debug) << "OFI transport (" << fId << "): data band connection request received. Accepting ...";
-        fDataEndpoint = tools::make_unique<asiofi::connected_endpoint>(fContext.GetIoContext(), *fOfiDomain, info);
-        fDataEndpoint->enable();
-        fDataEndpoint->accept([&]() {
-            LOG(debug) << "OFI transport (" << fId << "): data band connection accepted.";
-
-            boost::asio::post(fContext.GetIoContext(), std::bind(&Socket::RecvControlQueueReader, this));
-            fBound = true;
-        });
-    });
-
-    LOG(debug) << "OFI transport (" << fId << "): data band bound to " << fLocalAddr;
 }
 
 auto Socket::Connect(const string& address) -> bool
@@ -190,10 +159,9 @@ try {
 
     InitOfi(fRemoteAddr);
 
-    ConnectEndpoint(fControlEndpoint, Band::Control);
     ConnectEndpoint(fDataEndpoint, Band::Data);
 
-    boost::asio::post(fContext.GetIoContext(), std::bind(&Socket::RecvControlQueueReader, this));
+    boost::asio::post(fContext.GetIoContext(), std::bind(&Socket::RecvQueueReader, this));
 
     while (!fConnected) {
         this_thread::sleep_for(chrono::milliseconds(100));
@@ -203,7 +171,7 @@ try {
 } catch (const SilentSocketError& e) {
     // do not print error in this case, this is handled by FairMQDevice
     return false;
-} catch (const std::exception& e) {
+} catch (const exception& e) {
     LOG(error) << "OFI transport: " << e.what();
     return false;
 }
@@ -258,42 +226,6 @@ auto Socket::ConnectEndpoint(std::unique_ptr<asiofi::connected_endpoint>& endpoi
     }
 }
 
-// auto Socket::ReceiveDataAddressAnnouncement() -> void
-// {
-    // azmq::message ctrl;
-    // auto recv = fControlEndpoint.receive(ctrl);
-    // assert(recv == sizeof(DataAddressAnnouncement)); (void)recv;
-    // auto daa(static_cast<const DataAddressAnnouncement*>(ctrl.data()));
-    // assert(daa->type == ControlMessageType::DataAddressAnnouncement);
-//
-    // sockaddr_in remoteAddr;
-    // remoteAddr.sin_family = AF_INET;
-    // remoteAddr.sin_port = daa->port;
-    // remoteAddr.sin_addr.s_addr = daa->ipv4;
-//
-    // auto addr = Context::ConvertAddress(remoteAddr);
-    // addr.Protocol = fRemoteDataAddr.Protocol;
-    // LOG(debug) << "OFI transport (" << fId << "): Data address announcement of remote endpoint received: " << addr;
-    // fRemoteDataAddr = addr;
-// }
-//
-// auto Socket::AnnounceDataAddress() -> void
-// {
-    // fLocalDataAddr = fDataEndpoint->get_local_address();
-    // LOG(debug) << "Address of local ofi endpoint in socket " << fId << ": " << Context::ConvertAddress(fLocalDataAddr);
-//
-    // Create new data address announcement message
-    // auto daa = MakeControlMessage<DataAddressAnnouncement>();
-    // auto addr = Context::ConvertAddress(fLocalDataAddr);
-    // daa.ipv4 = addr.sin_addr.s_addr;
-    // daa.port = addr.sin_port;
-//
-    // auto sent = fControlEndpoint.send(boost::asio::buffer(daa));
-    // assert(sent == sizeof(addr)); (void)sent;
-//
-    // LOG(debug) << "OFI transport (" << fId << "): data band address " << fLocalDataAddr << " announced.";
-// }
-
 auto Socket::Send(MessagePtr& msg, const int /*timeout*/) -> int
 {
     // LOG(debug) << "OFI transport (" << fId << "): ENTER Send: data=" << msg->GetData() << ",size=" << msg->GetSize();
@@ -303,7 +235,7 @@ auto Socket::Send(MessagePtr& msg, const int /*timeout*/) -> int
         size_t size = msg->GetSize();
         OnSend(msg);
         return size;
-    } catch (const std::exception& e) {
+    } catch (const exception& e) {
         LOG(error) << e.what();
         return -1;
     } catch (const boost::system::error_code& e) {
@@ -316,27 +248,9 @@ auto Socket::OnSend(MessagePtr& msg) -> void
 {
     // LOG(debug) << "OFI transport (" << fId << "): ENTER OnSend";
 
-    auto size = msg->GetSize();
+    auto size = 2000000;
 
     // LOG(debug) << "OFI transport (" << fId << "):       OnSend: data=" << msg->GetData() << ",size=" << msg->GetSize();
-
-    // Create and send control message
-    auto ctrl = MakeControlMessageWithPmr<PostBuffer>(&fControlMemPool);
-    ctrl->size = size;
-    auto ctrl_msg = boost::asio::mutable_buffer(ctrl.get(), sizeof(PostBuffer));
-    if (fNeedOfiMemoryRegistration) {
-        asiofi::memory_region mr(*fOfiDomain, ctrl_msg, asiofi::mr::access::send);
-        auto desc = mr.desc();
-        fControlEndpoint->send(
-            ctrl_msg, desc, [&, ctrl2 = std::move(ctrl), mr2 = std::move(mr)](boost::asio::mutable_buffer) mutable {
-                // LOG(debug) << "OFI transport (" << fId << "): >>>>> Control message sent";
-            });
-    } else {
-        fControlEndpoint->send(ctrl_msg,
-                               [&, ctrl2 = std::move(ctrl)](boost::asio::mutable_buffer) mutable {
-                                // LOG(debug) << "OFI transport (" << fId << "): >>>>> Control message sent";
-                               });
-    }
 
     if (size) {
         boost::asio::mutable_buffer buffer(msg->GetData(), size);
@@ -386,9 +300,9 @@ try {
     azmq::message zmsg;
     auto recv = fRecvQueueRead.receive(zmsg);
 
-    size_t size(0);
+    size_t size = 0;
     if (recv > 0) {
-        msg = std::move(*(static_cast<MessagePtr*>(zmsg.buffer().data())));
+        msg = move(*(static_cast<MessagePtr*>(zmsg.buffer().data())));
         size = msg->GetSize();
     }
 
@@ -397,7 +311,7 @@ try {
 
     // LOG(debug) << "OFI transport (" << fId << "): LEAVE Receive";
     return size;
-} catch (const std::exception& e) {
+} catch (const exception& e) {
     LOG(error) << e.what();
     return -1;
 } catch (const boost::system::error_code& e) {
@@ -405,110 +319,63 @@ try {
     return -1;
 }
 
-auto Socket::Receive(std::vector<MessagePtr>& msgVec, const int timeout) -> int64_t
+auto Socket::Receive(vector<MessagePtr>& msgVec, const int timeout) -> int64_t
 {
     return ReceiveImpl(msgVec, 0, timeout);
 }
 
-auto Socket::RecvControlQueueReader() -> void
+auto Socket::RecvQueueReader() -> void
 {
     fRecvSem.async_wait([&] {
-        auto ctrl = MakeControlMessageWithPmr<PostBuffer>(&fControlMemPool);
-        auto ctrl_msg = boost::asio::mutable_buffer(ctrl.get(), sizeof(PostBuffer));
+        auto size = 2000000;
+        // LOG(debug) << "OFI transport (" << fId << "):       OnRecvControl: PostBuffer.size=" << size;
 
-        if (fNeedOfiMemoryRegistration) {
-            asiofi::memory_region mr(*fOfiDomain, ctrl_msg, asiofi::mr::access::recv);
-            auto desc = mr.desc();
+        // Receive data
+        if (size) {
+            auto msg = fContext.MakeReceiveMessage(size);
+            boost::asio::mutable_buffer buffer(msg->GetData(), size);
 
-            fControlEndpoint->recv(
-                ctrl_msg,
-                desc,
-                [&, ctrl2 = std::move(ctrl), mr2 = std::move(mr)](
-                    boost::asio::mutable_buffer) mutable { OnRecvControl(std::move(ctrl2)); });
+            if (fNeedOfiMemoryRegistration) {
+                asiofi::memory_region mr(*fOfiDomain, buffer, asiofi::mr::access::recv);
+                auto desc = mr.desc();
+
+                fDataEndpoint->recv(
+                    buffer,
+                    desc,
+                    [&, msg2 = std::move(msg), mr2 = std::move(mr)](
+                        boost::asio::mutable_buffer) mutable {
+                        MessagePtr* msgptr(new std::unique_ptr<Message>(std::move(msg2)));
+                        fRecvQueueWrite.async_send(
+                            azmq::message(boost::asio::const_buffer(msgptr, sizeof(MessagePtr))),
+                            [&](const boost::system::error_code& ec, size_t /*bytes_transferred2*/) {
+                                if (!ec) { fRecvSem.async_signal([&] { }); }
+                            });
+                    });
+
+            } else {
+                fDataEndpoint->recv(
+                    buffer, [&, msg2 = std::move(msg)](boost::asio::mutable_buffer) mutable {
+                        MessagePtr* msgptr(new std::unique_ptr<Message>(std::move(msg2)));
+                        fRecvQueueWrite.async_send(
+                            azmq::message(boost::asio::const_buffer(msgptr, sizeof(MessagePtr))),
+                            [&](const boost::system::error_code& ec, size_t /*bytes_transferred2*/) {
+                                if (!ec) { fRecvSem.async_signal([&] { }); }
+                            });
+                    });
+            }
         } else {
-            fControlEndpoint->recv(
-                ctrl_msg, [&, ctrl2 = std::move(ctrl)](boost::asio::mutable_buffer) mutable {
-                    OnRecvControl(std::move(ctrl2));
+            fRecvQueueWrite.async_send(
+                azmq::message(boost::asio::const_buffer(nullptr, 0)),
+                [&](const boost::system::error_code& ec, size_t /*bytes_transferred2*/) {
+                    if (!ec) { fRecvSem.async_signal([&] { }); }
                 });
-          }
+        }
+
+        boost::asio::post(fContext.GetIoContext(), bind(&Socket::RecvQueueReader, this));
     });
 }
 
-auto Socket::OnRecvControl(ofi::unique_ptr<PostBuffer> ctrl) -> void
-{
-    // LOG(debug) << "OFI transport (" << fId << "): ENTER OnRecvControl";
-
-    auto size = ctrl->size;
-    // LOG(debug) << "OFI transport (" << fId << "):       OnRecvControl: PostBuffer.size=" << size;
-
-    // Receive data
-    if (size) {
-        auto msg = fContext.MakeReceiveMessage(size);
-        boost::asio::mutable_buffer buffer(msg->GetData(), size);
-
-        if (fNeedOfiMemoryRegistration) {
-            asiofi::memory_region mr(*fOfiDomain, buffer, asiofi::mr::access::recv);
-            auto desc = mr.desc();
-
-            fDataEndpoint->recv(
-                buffer,
-                desc,
-                [&, msg2 = std::move(msg), mr2 = std::move(mr)](
-                    boost::asio::mutable_buffer) mutable {
-                    MessagePtr* msgptr(new std::unique_ptr<Message>(std::move(msg2)));
-                    fRecvQueueWrite.async_send(
-                        azmq::message(boost::asio::const_buffer(msgptr, sizeof(MessagePtr))),
-                        [&](const boost::system::error_code& ec, size_t /*bytes_transferred2*/) {
-                            if (!ec) {
-                                // LOG(debug) << "OFI transport (" << fId
-                                // << "): <<<<< Data buffer received, bytes_transferred2="
-                                // << bytes_transferred2;
-                                fRecvSem.async_signal([&] {
-                                    //LOG(debug) << "OFI transport (" << fId << "):     < Signal fRecvSem";
-                                });
-                            }
-                        });
-                });
-
-        } else {
-            fDataEndpoint->recv(
-                buffer, [&, msg2 = std::move(msg)](boost::asio::mutable_buffer) mutable {
-                    MessagePtr* msgptr(new std::unique_ptr<Message>(std::move(msg2)));
-                    fRecvQueueWrite.async_send(
-                        azmq::message(boost::asio::const_buffer(msgptr, sizeof(MessagePtr))),
-                        [&](const boost::system::error_code& ec, size_t /*bytes_transferred2*/) {
-                            if (!ec) {
-                                // LOG(debug) << "OFI transport (" << fId
-                                // << "): <<<<< Data buffer received, bytes_transferred2="
-                                // << bytes_transferred2;
-                                fRecvSem.async_signal([&] {
-                                    // LOG(debug) << "OFI transport (" << fId << "):     < Signal fRecvSem";
-                                });
-                            }
-                        });
-                });
-        }
-    } else {
-        fRecvQueueWrite.async_send(
-            azmq::message(boost::asio::const_buffer(nullptr, 0)),
-            [&](const boost::system::error_code& ec, size_t /*bytes_transferred2*/) {
-                if (!ec) {
-                    // LOG(debug) << "OFI transport (" << fId
-                    //            << "): <<<<< Data buffer received, bytes_transferred2="
-                    //            << bytes_transferred2;
-                    fRecvSem.async_signal([&] {
-                        // LOG(debug) << "OFI transport (" << fId << "):     < Signal fRecvSem";
-                    });
-                }
-            });
-    }
-
-    boost::asio::post(fContext.GetIoContext(), std::bind(&Socket::RecvControlQueueReader, this));
-
-    // LOG(debug) << "OFI transport (" << fId << "): LEAVE OnRecvControl";
-}
-
-auto Socket::Send(std::vector<MessagePtr>& msgVec, const int timeout) -> int64_t
+auto Socket::Send(vector<MessagePtr>& msgVec, const int timeout) -> int64_t
 {
     return SendImpl(msgVec, 0, timeout);
 }
@@ -516,172 +383,11 @@ auto Socket::Send(std::vector<MessagePtr>& msgVec, const int timeout) -> int64_t
 auto Socket::SendImpl(vector<FairMQMessagePtr>& /*msgVec*/, const int /*flags*/, const int /*timeout*/) -> int64_t 
 {
     throw SocketError{"Not yet implemented."};
-    // const unsigned int vecSize = msgVec.size();
-    // int elapsed = 0;
-    //
-    // // Sending vector typicaly handles more then one part
-    // if (vecSize > 1)
-    // {
-    //     int64_t totalSize = 0;
-    //     int nbytes = -1;
-    //     bool repeat = false;
-    //
-    //     while (true && !fInterrupted)
-    //     {
-    //         for (unsigned int i = 0; i < vecSize; ++i)
-    //         {
-    //             nbytes = zmq_msg_send(static_cast<FairMQMessageSHM*>(msgVec[i].get())->GetMessage(),
-    //                                   fSocket,
-    //                                   (i < vecSize - 1) ? ZMQ_SNDMORE|flags : flags);
-    //             if (nbytes >= 0)
-    //             {
-    //                 static_cast<FairMQMessageSHM*>(msgVec[i].get())->fQueued = true;
-    //                 size_t size = msgVec[i]->GetSize();
-    //
-    //                 totalSize += size;
-    //             }
-    //             else
-    //             {
-    //                 // according to ZMQ docs, this can only occur for the first part
-    //                 if (zmq_errno() == EAGAIN)
-    //                 {
-    //                     if (!fInterrupted && ((flags & ZMQ_DONTWAIT) == 0))
-    //                     {
-    //                         if (timeout)
-    //                         {
-    //                             elapsed += fSndTimeout;
-    //                             if (elapsed >= timeout)
-    //                             {
-    //                                 return -2;
-    //                             }
-    //                         }
-    //                         repeat = true;
-    //                         break;
-    //                     }
-    //                     else
-    //                     {
-    //                         return -2;
-    //                     }
-    //                 }
-    //                 if (zmq_errno() == ETERM)
-    //                 {
-    //                     LOG(info) << "terminating socket " << fId;
-    //                     return -1;
-    //                 }
-    //                 LOG(error) << "Failed sending on socket " << fId << ", reason: " << zmq_strerror(errno);
-    //                 return nbytes;
-    //             }
-    //         }
-    //
-    //         if (repeat)
-    //         {
-    //             continue;
-    //         }
-    //
-    //         // store statistics on how many messages have been sent (handle all parts as a single message)
-    //         ++fMessagesTx;
-    //         fBytesTx += totalSize;
-    //         return totalSize;
-    //     }
-    //
-    //     return -1;
-    // } // If there's only one part, send it as a regular message
-    // else if (vecSize == 1)
-    // {
-    //     return Send(msgVec.back(), flags);
-    // }
-    // else // if the vector is empty, something might be wrong
-    // {
-    //     LOG(warn) << "Will not send empty vector";
-    //     return -1;
-    // }
 }
 
 auto Socket::ReceiveImpl(vector<FairMQMessagePtr>& /*msgVec*/, const int /*flags*/, const int /*timeout*/) -> int64_t
 {
     throw SocketError{"Not yet implemented."};
-    // int64_t totalSize = 0;
-    // int64_t more = 0;
-    // bool repeat = false;
-    // int elapsed = 0;
-    //
-    // while (true)
-    // {
-    //     // Warn if the vector is filled before Receive() and empty it.
-    //     // if (msgVec.size() > 0)
-    //     // {
-    //     //     LOG(warn) << "Message vector contains elements before Receive(), they will be deleted!";
-    //     //     msgVec.clear();
-    //     // }
-    //
-    //     totalSize = 0;
-    //     more = 0;
-    //     repeat = false;
-    //
-    //     do
-    //     {
-    //         FairMQMessagePtr part(new FairMQMessageSHM(fManager, GetTransport()));
-    //         zmq_msg_t* msgPtr = static_cast<FairMQMessageSHM*>(part.get())->GetMessage();
-    //
-    //         int nbytes = zmq_msg_recv(msgPtr, fSocket, flags);
-    //         if (nbytes == 0)
-    //         {
-    //             msgVec.push_back(move(part));
-    //         }
-    //         else if (nbytes > 0)
-    //         {
-    //             MetaHeader* hdr = static_cast<MetaHeader*>(zmq_msg_data(msgPtr));
-    //             size_t size = 0;
-    //             static_cast<FairMQMessageSHM*>(part.get())->fHandle = hdr->fHandle;
-    //             static_cast<FairMQMessageSHM*>(part.get())->fSize = hdr->fSize;
-    //             static_cast<FairMQMessageSHM*>(part.get())->fRegionId = hdr->fRegionId;
-    //             static_cast<FairMQMessageSHM*>(part.get())->fHint = hdr->fHint;
-    //             size = part->GetSize();
-    //
-    //             msgVec.push_back(move(part));
-    //
-    //             totalSize += size;
-    //         }
-    //         else if (zmq_errno() == EAGAIN)
-    //         {
-    //             if (!fInterrupted && ((flags & ZMQ_DONTWAIT) == 0))
-    //             {
-    //                 if (timeout)
-    //                 {
-    //                     elapsed += fSndTimeout;
-    //                     if (elapsed >= timeout)
-    //                     {
-    //                         return -2;
-    //                     }
-    //                 }
-    //                 repeat = true;
-    //                 break;
-    //             }
-    //             else
-    //             {
-    //                 return -2;
-    //             }
-    //         }
-    //         else
-    //         {
-    //             return nbytes;
-    //         }
-    //
-    //         size_t more_size = sizeof(more);
-    //         zmq_getsockopt(fSocket, ZMQ_RCVMORE, &more, &more_size);
-    //     }
-    //     while (more);
-    //
-    //     if (repeat)
-    //     {
-    //         continue;
-    //     }
-    //
-    //     // store statistics on how many messages have been received (handle all parts as a single message)
-    //     ++fMessagesRx;
-    //     fBytesRx += totalSize;
-    //     return totalSize;
-    // }
 }
 
 auto Socket::Close() -> void {}
