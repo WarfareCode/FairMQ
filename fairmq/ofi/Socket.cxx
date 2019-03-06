@@ -248,7 +248,7 @@ auto Socket::OnSend(MessagePtr& msg) -> void
 {
     // LOG(debug) << "OFI transport (" << fId << "): ENTER OnSend";
 
-    auto size = 2000000;
+    auto size = msg->GetSize();
 
     // LOG(debug) << "OFI transport (" << fId << "):       OnSend: data=" << msg->GetData() << ",size=" << msg->GetSize();
 
@@ -327,8 +327,7 @@ auto Socket::Receive(vector<MessagePtr>& msgVec, const int timeout) -> int64_t
 auto Socket::RecvQueueReader() -> void
 {
     fRecvSem.async_wait([&] {
-        auto size = 2000000;
-        // LOG(debug) << "OFI transport (" << fId << "):       OnRecvControl: PostBuffer.size=" << size;
+        static size_t size = fContext.GetSizeHint(); // temporary hack to provide expected message size for receive
 
         // Receive data
         if (size) {
